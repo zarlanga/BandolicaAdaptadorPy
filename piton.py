@@ -21,7 +21,10 @@ ports2 = midiin.get_ports()
 
 print("Available MIDI input ports:", ports2)
 
-
+from pyo import Server, SfPlayer
+# Inicia servidor pyo (baja latencia)
+s = Server().boot()
+s.start()
 
 import os
 import numpy as np
@@ -39,67 +42,75 @@ sample_map = {
     102: "9_f6.wav",  # F6  = MIDI 102
 }
 
-# Carga todos los samples en memoria
-samples = {}
-sr = 44100
-for midi_note, fname in sample_map.items():
-    path = os.path.join("mi_troilo", fname)
-    y, _ = librosa.load(path, sr=sr)
-    samples[midi_note] = y
 
-def play_midi_note(midi_note):
+# Mapa de paths (pyo leerá los archivos directamente)
+sample_paths = {k: os.path.join("mi_troilo", v) for k, v in sample_map.items()}
+
+# Voces activas: key = (port_index, midi_note), value = SfPlayer instance
+active_players = {}
+
+def play_midi_note(midi_note, port):
     # Encuentra el sample base más cercano
-    base_note = min(samples.keys(), key=lambda n: abs(n - midi_note))
-    y = samples[base_note]
-    n_steps = midi_note - base_note  # diferencia en semitonos
+    if len(sample_paths) == 0:
+        print("No sample paths available")
+        return
+    base_note = min(sample_paths.keys(), key=lambda n: abs(n - midi_note))
+    path = sample_paths[base_note]
+    if not os.path.isfile(path):
+        print("Sample file not found: %s", path)
+        return
+    n_steps = midi_note - base_note
+    speed = 2 ** (n_steps / 12.0)  # factor de velocidad para semitonos
 
-    # Aplica pitch shift si es necesario
-    if n_steps != 0:
-        y = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps)
+    # Si ya hay una voz para esa nota+port, pararla antes
+    key = (port, midi_note)
+    old = active_players.get(key)
+    if old:
+        try:
+            old.stop()
+        except Exception:
+            pass
 
-    sd.play(y, sr)
-    #sd.wait()
-
-
-
-
-"""
-pathNota = "mi_troilo/2_f2.wav"
-
-
-y, sr = librosa.load(pathNota, sr=44100)
-
-sd.play(y, sr)
-sd.wait()
-print("Playing sound...")
-
-y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=4)
+    # Crear y reproducir la voz
+    try:
+        player = SfPlayer(path, speed=speed, loop=False, mul=0.9).out()
+        active_players[key] = player
+    except Exception as e:
+        print("Failed to play %s: %s", path, e)
 
 
+def stop_midi_note(midi_note, port):
+    key = (port, midi_note)
+    player = active_players.pop(key, None)
+    if player:
+        try:
+            player.stop()
+        except Exception:
+            pass
 
-sd.play(y_shifted, sr)
-sd.wait()
-print("Playing shifted sound...")
 
-"""
 
-def cb(msg,port):
-        print(f"Received message on port {port}: {msg}")
+
+def cb(msg, port):
+    # rtmidi callback receives (message, delta_time)
+    try:
         message, delta_time = msg
-        #midiout_left.send_message(message)
-        if len(message) >= 3 and (message[0] & 0xF0) == 0x90 and message[2] > 0:
-            midi_note = message[1]
-            play_midi_note(midi_note)
-        elif len(message) >= 3 and ( 
+    except Exception:
+        print("Malformed midi message: %s", msg)
+        return
+    print("Received message on port %s: %s", port, message)
+    if not isinstance(message, (list, tuple)) or len(message) < 3:
+        return
+    status = message[0] & 0xF0
+    note = message[1]
+    vel = message[2]
 
-            ((message[0] & 0xF0) == 0x80) or
-            ((message[0] & 0xF0) == 0x90 and message[2] == 0)
-
-            ):
-            print("Stopping sound")
-            
-            sd.stop()
-
+    # Note On with vel > 0
+    if status == 0x90 and vel > 0:
+        play_midi_note(note, port)
+    # Note Off (0x80) or Note On with vel == 0
+    elif status == 0x80 or (status == 0x90 and vel == 0):
+        stop_midi_note(note, port)
 
 idx=0
 
